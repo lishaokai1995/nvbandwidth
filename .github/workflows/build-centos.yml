@@ -1,0 +1,124 @@
+# Build nvbandwidth as a CentOS/RHEL 8 compatible binary.
+#
+# Why a container: the local machine has no CUDA toolkit / GPU, so the binary
+# is compiled in CI inside NVIDIA's official CUDA "devel" image based on the Red
+# Hat Universal Base Image 8 (glibc 2.28). A binary built against glibc 2.28
+# runs on CentOS Stream 8 / RHEL 8 / Rocky 8 / Alma 8 and also on newer RHEL 9.
+#
+# The devel image pre-sets LIBRARY_PATH=/usr/local/cuda/lib64/stubs, so linking
+# against the driver libraries (libcuda, libnvidia-ml) works even though the CI
+# runner has no GPU or NVIDIA driver installed.
+
+name: Build nvbandwidth (CentOS/RHEL 8)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '**.cpp'
+      - '**.h'
+      - '**.hpp'
+      - '**.cu'
+      - '**.cuh'
+      - 'CMakeLists.txt'
+      - 'detect_cuda_arch.cmake'
+      - '.github/workflows/build-centos.yml'
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.4.1-devel-ubi8
+    env:
+      CUDA_STUBS: /usr/local/cuda/lib64/stubs
+
+    steps:
+      - name: Install build tools
+        run: |
+          set -e
+          PKGS="git make tar gzip curl which file binutils"
+          if command -v dnf >/dev/null 2>&1; then
+            dnf install -y $PKGS
+          else
+            microdnf install -y $PKGS
+          fi
+
+      - name: Ensure CMake >= 3.20
+        run: |
+          set -e
+          use_system=1
+          if command -v cmake >/dev/null 2>&1; then
+            ver=$(cmake --version | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)
+            major=${ver%.*}; minor=${ver#*.}
+            if [ "$major" -gt 3 ] || { [ "$major" -eq 3 ] && [ "$minor" -ge 20 ]; }; then
+              echo "Using system CMake $ver"
+            else
+              use_system=0
+            fi
+          else
+            use_system=0
+          fi
+          if [ "$use_system" -eq 0 ]; then
+            echo "System CMake missing or < 3.20; downloading CMake 3.28.3"
+            curl -fsSL -o /tmp/cmake.tar.gz \
+              https://github.com/Kitware/CMake/releases/download/v3.28.3/cmake-3.28.3-linux-x86_64.tar.gz
+            mkdir -p /opt/cmake
+            tar -xzf /tmp/cmake.tar.gz -C /opt/cmake --strip-components=1
+            echo "/opt/cmake/bin" >> "$GITHUB_PATH"
+          fi
+
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Show toolchain
+        run: |
+          cmake --version | head -1
+          gcc --version | head -1
+          nvcc --version | tail -2
+
+      - name: Configure
+        run: |
+          set -e
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_EXE_LINKER_FLAGS="-L${CUDA_STUBS}"
+
+      - name: Build
+        run: |
+          set -e
+          cmake --build build -j"$(nproc)"
+
+      - name: Inspect binary
+        run: |
+          set -e
+          file build/nvbandwidth
+          echo "--- required shared libraries (NEEDED) ---"
+          readelf -d build/nvbandwidth | grep NEEDED || true
+
+      - name: Smoke test (best effort)
+        continue-on-error: true
+        run: |
+          # Expose stub driver libs under the versioned sonames so the binary can
+          # be loaded on a GPU-less runner. --version returns before any cuInit(),
+          # so no real driver is required to run it.
+          cd "${CUDA_STUBS}"
+          for l in libcuda.so.1 libnvidia-ml.so.1; do
+            base="${l%.1}"
+            if [ ! -e "$l" ] && [ -e "$base" ]; then
+              ln -sf "$base" "$l"
+            fi
+          done
+          cd - >/dev/null
+          LD_LIBRARY_PATH="${CUDA_STUBS}:${LD_LIBRARY_PATH}" ./build/nvbandwidth --version
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nvbandwidth-centos8-cuda12.4
+          path: build/nvbandwidth
+          if-no-files-found: error
